@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 
+import time
 import os
+import time
 import csv
 import eyed3
 import argparse
 import youtube_dl
 import spotipy
 import spotipy.util as util
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from unidecode import unidecode
 
 
@@ -45,51 +49,79 @@ def download_finish(d):
         print("\x1b[1A[\033[93mConverting\033[00m] %s" % d['filename'])
 
 
-def download_songs(songs, folder):
-    for song in songs:
-        probable_filename = folder + '/' + song['name'] + ' - ' + \
-            song['artist'] + '.mp3'
-        if os.path.isfile(probable_filename):
-            # The file may already be there, so skip
-            print('[\033[93mSkipping\033[00m] %s by %s' % \
-                (song['name'], song['artist']))
-            continue
-        opts = {
-            'format': 'bestaudio/best',
-            'forcejson': True,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '256',
-            }],
-     #       'verbose': True,
-            'progress_hooks': [download_finish],
-            'logger': MyLogger(),
-            'outtmpl': folder + '/' + song['name'] + ' - ' + song['artist'] + '.%(ext)s'
-        }
-        url = ' '.join([song['name'], song['artist'], 'audio', 'youtube'])
-        url = 'ytsearch:' + url
-        print('[\033[91mFetching\033[00m] %s' % probable_filename)
-        with youtube_dl.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        if os.path.isfile(probable_filename):
-            afile = eyed3.load(probable_filename)
-            afile.tag.title = song['name']
-            afile.tag.artist = song['artist']
-            afile.tag.album = song['album']
-            afile.tag.save()
-        else:
-            print('\x1b[1A\x1b[2K')
-            print('\x1b[1A[\033[91mMetadata\033[00m] Could not set metadata for %s\nTemp' % \
-                probable_filename)
-
+def download_song(song, folder):
+    probable_filename = folder + '/' + song['name'] + ' - ' + \
+        song['artist'] + '.mp3'
+    if os.path.isfile(probable_filename):
+        # The file may already be there, so skip
+        print('[\033[93mSkipping\033[00m] %s by %s' % \
+            (song['name'], song['artist']))
+        return
+    opts = {
+        'format': 'bestaudio/best',
+        'forcejson': True,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '256',
+        }],
+ #       'verbose': True,
+        'progress_hooks': [download_finish],
+        'logger': MyLogger(),
+        'outtmpl': folder + '/' + song['name'] + ' - ' + song['artist'] + '.%(ext)s'
+    }
+    url = ' '.join([song['name'], song['artist'], 'audio', 'youtube'])
+    url = 'ytsearch:' + url
+    print('[\033[91mFetching\033[00m] %s' % probable_filename)
+    with youtube_dl.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+    if os.path.isfile(probable_filename):
+        afile = eyed3.load(probable_filename)
+        afile.tag.title = song['name']
+        afile.tag.artist = song['artist']
+        afile.tag.album = song['album']
+        afile.tag.save()
+    else:
         print('\x1b[1A\x1b[2K')
-        print('\x1b[1A[\033[92mDownloaded]\033[00m', song['name'], '-', song['artist'])
+        print('\x1b[1A[\033[91mMetadata\033[00m] Could not set metadata for %s\nTemp' % \
+            probable_filename)
+
+    print('\x1b[1A\x1b[2K')
+    print('\x1b[1A[\033[92mDownloaded]\033[00m', song['name'], '-', song['artist'])
+
+def force_download_song(song, folder):
+    tries = 20
+    while tries > 0:
+        try:
+            download_song(song, folder)
+            return
+        except (spotipy.exceptions.SpotifyException, youtube_dl.utils.DownloadError, Exception):
+            print('\x1b[1A\x1b[2K')
+            print('[\033[91mFAILED\033[00m] Could not download %s Trying again' % song)
+            time.sleep(3)
+        tries -= 1
+    print('[\033[91mFAILED\033[00m] Could not download %s. Gave up.' % song)
+
+
+
+async def download_songs(songs, folder):
+    futures = []
+    executor = ThreadPoolExecutor(max_workers=20)
+    loop = asyncio.get_event_loop()
+    print(f"Songs: {len(songs)}\n")
+    for song in songs:
+        print(f"Adding: {song}\n")
+        future = loop.run_in_executor(executor, force_download_song, song, folder)
+        futures.append(future)
+
+    await asyncio.sleep(4)
+    res = await asyncio.gather(*futures)
 
 
 def get_songs_from_playlist(tracks, args):
     songs = []
-    for item in tracks['items'][args.skip:]:
+    print(f"tracks: {len(tracks)}")
+    for item in tracks[args.skip:]:
         track = item['track']
         songs.append({
             'name': unidecode(track['name']).strip(),
@@ -97,6 +129,26 @@ def get_songs_from_playlist(tracks, args):
             'album': unidecode(track['album']['name']).strip()
         })
     return songs
+
+
+def get_all_tracks(sp, username, playlist_id):
+    tracks = []
+    limit = 100
+    offset = 0
+
+    while True:
+        new_tracks = sp.user_playlist_tracks(
+            username,
+            playlist_id,
+            limit=limit,
+            offset=offset,
+        )['items']
+        if len(new_tracks) == 0:
+            break
+        tracks.extend(new_tracks)
+        offset = offset + len(new_tracks)
+    return tracks
+
 
 
 def main():
@@ -114,6 +166,8 @@ def main():
 
     # getting current working directory
     folder = os.path.dirname(os.path.realpath(__file__))
+
+    loop = asyncio.get_event_loop()
 
     if args.folder:
         if os.path.isdir(args.folder):
@@ -133,7 +187,7 @@ def main():
         if os.path.isfile(args.csv):
             csvfile = args.csv
             songs = get_songs_from_csvfile(csvfile, args)
-            download_songs(songs, folder)
+            loop.create_task(download_songs(songs, folder))
         else:
             print('No such csv file. Aborting..')
             exit()
@@ -164,10 +218,9 @@ def main():
                                 print('Error while creating folder')
                                 raise
                        playlist_id = playlists['items'][int(n[i]) - 1]['id']
-                       tracks = sp.user_playlist(args.username, playlist_id,
-                                                  fields="tracks,next")['tracks']
+                       tracks = get_all_tracks(sp, args.username, playlist_id)
                        songs = get_songs_from_playlist(tracks, args)
-                       download_songs(songs, playlist_folder )
+                       loop.create_task(download_songs(songs, playlist_folder))
                 else:
                     print("No S.N. Provided! Aborting...")
             else:
@@ -176,6 +229,8 @@ def main():
             print("Can't get token for", username)
             exit()
 
+    loop.run_forever()
+    loop.close()
 
 if __name__ == '__main__':
     main()
